@@ -76,7 +76,8 @@ class CumminsConnectCloudConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     aura_login, user_input[CONF_USERNAME], user_input[CONF_PASSWORD]
                 )
                 assets = await self._validate_and_list_assets(tokens["refresh_token"])
-            except (AuraLoginError, CumminsAuthError):
+            except (AuraLoginError, CumminsAuthError) as err:
+                _LOGGER.warning("Cummins sign-in failed: %s", err)
                 errors["base"] = "invalid_auth"
             except CumminsApiError:
                 errors["base"] = "cannot_connect"
@@ -167,7 +168,8 @@ class CumminsConnectCloudConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 )
                 api = CumminsConnectCloudApi(refresh_token=tokens["refresh_token"])
                 await self.hass.async_add_executor_job(api.validate)
-            except (AuraLoginError, CumminsAuthError):
+            except (AuraLoginError, CumminsAuthError) as err:
+                _LOGGER.warning("Cummins sign-in failed: %s", err)
                 errors["base"] = "invalid_auth"
             except CumminsApiError:
                 errors["base"] = "cannot_connect"
