@@ -58,6 +58,16 @@ class AuraLoginError(Exception):
     """Raised when the username/password login fails at any step."""
 
 
+def _diagnostics(resp: requests.Response) -> str:
+    """A short, log-line-friendly dump of an unexpected response — status,
+    final URL (redirects can land somewhere unexpected), and a text snippet
+    (long enough to reveal a captcha/WAF-block/error page, short enough to
+    stay readable in a log line).
+    """
+    snippet = re.sub(r"\s+", " ", resp.text[:500]).strip()
+    return f"status={resp.status_code} url={resp.url} body[:500]={snippet!r}"
+
+
 def _pkce() -> tuple[str, str]:
     verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
     challenge = base64.urlsafe_b64encode(
@@ -202,7 +212,13 @@ def login(username: str, password: str) -> dict:
     verifier, challenge = _pkce()
     state = secrets.token_urlsafe(32)
     session = requests.Session()
-    session.headers.update({"user-agent": USER_AGENT})
+    session.headers.update(
+        {
+            "user-agent": USER_AGENT,
+            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "accept-language": "en-US,en;q=0.9",
+        }
+    )
 
     authorize_url = f"{AUTHORIZE_URL}?" + urllib.parse.urlencode(
         {
@@ -225,7 +241,10 @@ def login(username: str, password: str) -> dict:
             "Expected the initial SAML hop to land on a 401 bounce page, "
             f"got {resp.status_code} at {resp.url}"
         )
-    bounce_url = _extract_js_redirect(resp.text, resp.url)
+    try:
+        bounce_url = _extract_js_redirect(resp.text, resp.url)
+    except AuraLoginError as err:
+        raise AuraLoginError(f"{err} [{_diagnostics(resp)}]") from err
 
     # The bounce URL's own `startURL` query param is exactly the value
     # Cummins' custom login Apex controller wants back later (both
@@ -242,7 +261,10 @@ def login(username: str, password: str) -> dict:
     page_uri = parsed_login_page.path + (
         f"?{parsed_login_page.query}" if parsed_login_page.query else ""
     )
-    context = _extract_login_context(resp.text)
+    try:
+        context = _extract_login_context(resp.text)
+    except AuraLoginError as err:
+        raise AuraLoginError(f"{err} [{_diagnostics(resp)}]") from err
     aura_endpoint = f"{parsed_login_page.scheme}://{parsed_login_page.netloc}/clw/s/sfsites/aura"
 
     # 3. Submit credentials via the same Apex bridge the app's browser
@@ -270,13 +292,19 @@ def login(username: str, password: str) -> dict:
     #    follow its own bounce back into the SAML SP flow.
     resp = session.get(frontdoor_url, timeout=LOGIN_TIMEOUT)
     resp.raise_for_status()
-    saml_continue_url = _extract_js_redirect(resp.text, resp.url)
+    try:
+        saml_continue_url = _extract_js_redirect(resp.text, resp.url)
+    except AuraLoginError as err:
+        raise AuraLoginError(f"{err} [{_diagnostics(resp)}]") from err
     resp = session.get(saml_continue_url, timeout=LOGIN_TIMEOUT)
     resp.raise_for_status()
 
     # 5. Now-authenticated /clw/idp/login returns an auto-submitting SAML
     #    form; POST it to Cognito ourselves instead of running its JS.
-    saml_action_url, saml_fields = _extract_saml_form(resp.text)
+    try:
+        saml_action_url, saml_fields = _extract_saml_form(resp.text)
+    except AuraLoginError as err:
+        raise AuraLoginError(f"{err} [{_diagnostics(resp)}]") from err
     resp = session.post(
         saml_action_url, data=saml_fields, timeout=LOGIN_TIMEOUT, allow_redirects=False
     )
