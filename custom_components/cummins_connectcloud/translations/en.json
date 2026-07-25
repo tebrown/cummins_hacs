@@ -3,7 +3,23 @@
     "step": {
       "user": {
         "title": "Connect to Cummins Connect Cloud",
-        "description": "Paste the refresh token produced by running `tools/bootstrap_login.py` on your laptop (see the repository README). Home Assistant only ever sees this token, never your Cummins/Salesforce password.",
+        "description": "How do you want to sign in?",
+        "menu_options": {
+          "credentials": "Username and password",
+          "token": "Refresh token (advanced)"
+        }
+      },
+      "credentials": {
+        "title": "Sign in to Cummins Connect Cloud",
+        "description": "Enter your Cummins Connect Cloud username and password. These are used once to sign in and are not stored — only the resulting session token is saved.",
+        "data": {
+          "username": "Username",
+          "password": "Password"
+        }
+      },
+      "token": {
+        "title": "Connect with a refresh token",
+        "description": "Advanced / fallback option. Paste the refresh token produced by running `tools/bootstrap_login.py` on your laptop (see the repository README) — useful if signing in with username/password above doesn't work.",
         "data": {
           "refresh_token": "Refresh token"
         }
@@ -17,14 +33,15 @@
       },
       "reauth_confirm": {
         "title": "Re-authenticate Cummins Connect Cloud",
-        "description": "The stored refresh token is no longer valid (it may have expired or been revoked). Run `tools/bootstrap_login.py` again and paste the new refresh token below.",
+        "description": "Your Cummins Connect Cloud session is no longer valid. Enter your username and password to sign in again.",
         "data": {
-          "refresh_token": "Refresh token"
+          "username": "Username",
+          "password": "Password"
         }
       }
     },
     "error": {
-      "invalid_auth": "The refresh token was rejected. It may be expired or revoked — re-run the bootstrap tool.",
+      "invalid_auth": "Sign-in was rejected — check your username/password (or refresh token), or it may have expired.",
       "cannot_connect": "Could not reach Cummins Connect Cloud. Check your network connection and try again.",
       "no_assets": "No generators were found on this Cummins account.",
       "unknown": "Unexpected error. Check the Home Assistant logs for details."

@@ -9,6 +9,8 @@ venv/
 .cummins_tokens.json
 tools/login_error.png
 tools/login_page.html
+*.har
+login_capture*.json
 
 # OS / editor
 .DS_Store

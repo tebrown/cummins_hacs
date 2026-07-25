@@ -1,9 +1,14 @@
 """Config flow for Cummins Connect Cloud.
 
-There is no interactive OAuth here: HA is headless and shouldn't bundle a
-browser just to complete a JS-rendered Salesforce SSO login. Instead the user
-runs ``tools/bootstrap_login.py`` once, off-box, and pastes the resulting
-refresh token in. See docs/DESIGN.md section 5 for why.
+Two ways to authenticate:
+  * Username + password (default): a pure-HTTP reimplementation of the
+    Salesforce/Cognito SSO login (aura_auth.py) — works on every HA install
+    type, including HAOS, since it needs no browser. This is screen-scraping
+    an undocumented login flow, though — see aura_auth.py's module docstring
+    and docs/DESIGN.md for the known fragility.
+  * Refresh token (advanced): paste a token obtained by running
+    tools/bootstrap_login.py off-box. Kept as a fallback in case Cummins
+    changes their login page in a way aura_auth.py can't follow.
 """
 
 from __future__ import annotations
@@ -14,14 +19,20 @@ from typing import Any
 import voluptuous as vol
 
 from homeassistant import config_entries
+from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.data_entry_flow import FlowResult
 
 from .api import CumminsApiError, CumminsAuthError, CumminsConnectCloudApi
+from .aura_auth import AuraLoginError
+from .aura_auth import login as aura_login
 from .const import CONF_ASSET_ID, CONF_ASSET_NAME, CONF_REFRESH_TOKEN, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
 STEP_TOKEN_SCHEMA = vol.Schema({vol.Required(CONF_REFRESH_TOKEN): str})
+STEP_CREDENTIALS_SCHEMA = vol.Schema(
+    {vol.Required(CONF_USERNAME): str, vol.Required(CONF_PASSWORD): str}
+)
 
 
 class CumminsConnectCloudConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -42,10 +53,51 @@ class CumminsConnectCloudConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         await self.hass.async_add_executor_job(api.validate)
         return await self.hass.async_add_executor_job(api.list_assets)
 
+    async def _async_after_assets(self, assets: list[dict[str, Any]]) -> FlowResult:
+        self._assets = assets
+        if len(assets) == 1:
+            return await self._async_create_entry(assets[0])
+        return await self.async_step_asset()
+
+    # --- entry point ---------------------------------------------------------
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """First step: collect and validate the refresh token."""
+        return self.async_show_menu(step_id="user", menu_options=["credentials", "token"])
+
+    # --- primary path: username/password, no browser needed ------------------
+    async def async_step_credentials(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            try:
+                tokens = await self.hass.async_add_executor_job(
+                    aura_login, user_input[CONF_USERNAME], user_input[CONF_PASSWORD]
+                )
+                assets = await self._validate_and_list_assets(tokens["refresh_token"])
+            except (AuraLoginError, CumminsAuthError):
+                errors["base"] = "invalid_auth"
+            except CumminsApiError:
+                errors["base"] = "cannot_connect"
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("Unexpected error logging in")
+                errors["base"] = "unknown"
+            else:
+                if not assets:
+                    errors["base"] = "no_assets"
+                else:
+                    self._refresh_token = tokens["refresh_token"]
+                    return await self._async_after_assets(assets)
+
+        return self.async_show_form(
+            step_id="credentials", data_schema=STEP_CREDENTIALS_SCHEMA, errors=errors
+        )
+
+    # --- advanced/fallback path: paste a refresh token ------------------------
+    async def async_step_token(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
         errors: dict[str, str] = {}
         if user_input is not None:
             try:
@@ -64,19 +116,16 @@ class CumminsConnectCloudConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     errors["base"] = "no_assets"
                 else:
                     self._refresh_token = user_input[CONF_REFRESH_TOKEN]
-                    self._assets = assets
-                    if len(assets) == 1:
-                        return await self._async_create_entry(assets[0])
-                    return await self.async_step_asset()
+                    return await self._async_after_assets(assets)
 
         return self.async_show_form(
-            step_id="user", data_schema=STEP_TOKEN_SCHEMA, errors=errors
+            step_id="token", data_schema=STEP_TOKEN_SCHEMA, errors=errors
         )
 
     async def async_step_asset(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Second step (multi-generator accounts only): pick which asset."""
+        """Shared final step (multi-generator accounts only): pick which asset."""
         if user_input is not None:
             asset = next(a for a in self._assets if a["id"] == user_input[CONF_ASSET_ID])
             return await self._async_create_entry(asset)
@@ -113,14 +162,17 @@ class CumminsConnectCloudConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
         if user_input is not None:
             try:
-                api = CumminsConnectCloudApi(refresh_token=user_input[CONF_REFRESH_TOKEN])
+                tokens = await self.hass.async_add_executor_job(
+                    aura_login, user_input[CONF_USERNAME], user_input[CONF_PASSWORD]
+                )
+                api = CumminsConnectCloudApi(refresh_token=tokens["refresh_token"])
                 await self.hass.async_add_executor_job(api.validate)
-            except CumminsAuthError:
+            except (AuraLoginError, CumminsAuthError):
                 errors["base"] = "invalid_auth"
             except CumminsApiError:
                 errors["base"] = "cannot_connect"
             except Exception:  # noqa: BLE001
-                _LOGGER.exception("Unexpected error validating refresh token")
+                _LOGGER.exception("Unexpected error logging in")
                 errors["base"] = "unknown"
             else:
                 assert self._reauth_entry is not None
@@ -128,12 +180,12 @@ class CumminsConnectCloudConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     self._reauth_entry,
                     data={
                         **self._reauth_entry.data,
-                        CONF_REFRESH_TOKEN: user_input[CONF_REFRESH_TOKEN],
+                        CONF_REFRESH_TOKEN: tokens["refresh_token"],
                     },
                 )
                 await self.hass.config_entries.async_reload(self._reauth_entry.entry_id)
                 return self.async_abort(reason="reauth_successful")
 
         return self.async_show_form(
-            step_id="reauth_confirm", data_schema=STEP_TOKEN_SCHEMA, errors=errors
+            step_id="reauth_confirm", data_schema=STEP_CREDENTIALS_SCHEMA, errors=errors
         )

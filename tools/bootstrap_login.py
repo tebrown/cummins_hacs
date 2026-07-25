@@ -33,6 +33,16 @@ USAGE:
 NOTE: This will break if the user has MFA enabled (by design, for now) or if
 Cummins changes their login page. On any failure it saves login_error.png and
 login_page.html next to this script so you can see what the page looked like.
+
+CAPTURING THE AURA SEQUENCE (for reverse-engineering a pure-HTTP login, so the
+HA integration can ask for username/password directly instead of requiring
+this script): add --har login_capture.har to also record the full network
+conversation, PLUS a login_capture.aura.json sidecar with every Aura call's
+request/response body captured live (the passive .har capture unreliably
+drops response bodies sent with Cache-Control: no-store, which is exactly
+what the login POST uses). Redact BOTH files before sharing:
+    python tools/redact_har.py login_capture.har login_capture.redacted.har
+    python tools/redact_har.py login_capture.aura.json login_capture.aura.redacted.json
 """
 
 from __future__ import annotations
@@ -129,7 +139,13 @@ def _dump_debug(page, tag: str) -> None:
         print(f"  [debug] could not dump page: {e}")
 
 
-def bootstrap(username: str, password: str, headed: bool = False) -> None:
+def bootstrap(
+    username: str,
+    password: str,
+    headed: bool = False,
+    har_path: Path | str | None = None,
+    proxy: dict | None = None,
+) -> None:
     # Import here so `--help` works without playwright installed.
     try:
         from playwright.sync_api import sync_playwright
@@ -148,8 +164,20 @@ def bootstrap(username: str, password: str, headed: bool = False) -> None:
             captured["url"] = url
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=not headed)
-        context = browser.new_context(user_agent=USER_AGENT)
+        browser = p.chromium.launch(headless=not headed, proxy=proxy)
+        context_kwargs = {"user_agent": USER_AGENT}
+        if proxy:
+            # Routing through a local MITM proxy (see capture_via_mitm.py)
+            # means the proxy's self-signed cert won't be in any trust
+            # store; this is a local, deliberate capture session, not a
+            # real network path, so ignoring the cert error is fine here.
+            context_kwargs["ignore_https_errors"] = True
+        if har_path:
+            # record_har_content="embed" inlines response bodies (incl. the
+            # Aura login page's bootstrap JSON) so the .har is self-contained.
+            context_kwargs["record_har_path"] = str(har_path)
+            context_kwargs["record_har_content"] = "embed"
+        context = browser.new_context(**context_kwargs)
         page = context.new_page()
         page.set_default_navigation_timeout(NAV_TIMEOUT)
 
@@ -168,84 +196,111 @@ def bootstrap(username: str, password: str, headed: bool = False) -> None:
         # dismiss any "open external app?" dialog so it can't block us
         page.on("dialog", lambda d: d.dismiss())
 
-        print("Opening login page ...")
-        try:
-            page.goto(auth_url, wait_until="domcontentloaded")
-        except Exception:
-            # A goto to a page that ends up redirecting to connectcloud:// can
-            # itself raise — that's fine if we captured the code.
-            pass
+        # --- Capture Aura request/response bodies directly, in real time ------
+        # Playwright's passive HAR body capture unreliably misses responses
+        # sent with Cache-Control: no-store (which the login POST response
+        # uses, for obvious reasons) — it races the browser's own cache
+        # eviction. Reading resp.text() synchronously inside the response
+        # handler, while the body is still live, doesn't have that race.
+        aura_log: list[dict] = []
 
-        if "url" not in captured:
-            print("Filling credentials ...")
-            # Wait for *some* login field to render first.
-            email_candidates = [
-                ("label email/username", page.get_by_label(re.compile(r"e-?mail|user\s*name|username", re.I))),
-                ("input[type=email]", page.locator('input[type="email"]')),
-                ("autocomplete=username", page.locator('input[autocomplete="username"]')),
-                ("name~=username", page.locator('input[name*="username" i]')),
-                ("name~=email", page.locator('input[name*="email" i]')),
-                ("id~=username", page.locator('input[id*="username" i]')),
-            ]
-            pwd_candidates = [
-                ("input[type=password]", page.locator('input[type="password"]')),
-                ("label password", page.get_by_label(re.compile(r"password", re.I))),
-                ("autocomplete=current-password", page.locator('input[autocomplete="current-password"]')),
-            ]
-            submit_candidates = [
-                ("role=button login", page.get_by_role("button", name=re.compile(r"log\s*in|sign\s*in|login|continue|next", re.I))),
-                ("button[type=submit]", page.locator('button[type="submit"]')),
-                ("input[type=submit]", page.locator('input[type="submit"]')),
-                ("text Log In", page.get_by_text(re.compile(r"^\s*(log\s*in|sign\s*in)\s*$", re.I))),
-            ]
-
+        def _maybe_log_aura(resp) -> None:
+            if "/sfsites/aura" not in resp.url:
+                return
+            entry: dict = {
+                "url": resp.url,
+                "status": resp.status,
+                "request_post_data": resp.request.post_data,
+            }
             try:
-                # give the JS-rendered form time to appear
-                page.wait_for_selector(
-                    'input[type="email"], input[type="password"], input[autocomplete="username"]',
-                    timeout=FIELD_TIMEOUT,
-                )
+                entry["response_text"] = resp.text()
+            except Exception as e:  # response body already gone/aborted
+                entry["response_text_error"] = str(e)
+            aura_log.append(entry)
+
+        if har_path:
+            page.on("response", _maybe_log_aura)
+
+        try:
+            print("Opening login page ...")
+            try:
+                page.goto(auth_url, wait_until="domcontentloaded")
             except Exception:
-                _dump_debug(page, "waiting-for-login-form")
-                browser.close()
-                sys.exit("Could not find the login form. See login_page.html to "
-                         "adjust selectors (the fields may be inside a shadow root "
-                         "with unusual names).")
+                # A goto to a page that ends up redirecting to connectcloud:// can
+                # itself raise — that's fine if we captured the code.
+                pass
 
-            if not _fill_first(page, email_candidates, username, "username"):
-                _dump_debug(page, "fill-username")
-                browser.close()
-                sys.exit("Could not fill the username field — see debug dump.")
+            if "url" not in captured:
+                print("Filling credentials ...")
+                # Wait for *some* login field to render first.
+                email_candidates = [
+                    ("label email/username", page.get_by_label(re.compile(r"e-?mail|user\s*name|username", re.I))),
+                    ("input[type=email]", page.locator('input[type="email"]')),
+                    ("autocomplete=username", page.locator('input[autocomplete="username"]')),
+                    ("name~=username", page.locator('input[name*="username" i]')),
+                    ("name~=email", page.locator('input[name*="email" i]')),
+                    ("id~=username", page.locator('input[id*="username" i]')),
+                ]
+                pwd_candidates = [
+                    ("input[type=password]", page.locator('input[type="password"]')),
+                    ("label password", page.get_by_label(re.compile(r"password", re.I))),
+                    ("autocomplete=current-password", page.locator('input[autocomplete="current-password"]')),
+                ]
+                submit_candidates = [
+                    ("role=button login", page.get_by_role("button", name=re.compile(r"log\s*in|sign\s*in|login|continue|next", re.I))),
+                    ("button[type=submit]", page.locator('button[type="submit"]')),
+                    ("input[type=submit]", page.locator('input[type="submit"]')),
+                    ("text Log In", page.get_by_text(re.compile(r"^\s*(log\s*in|sign\s*in)\s*$", re.I))),
+                ]
 
-            if not _fill_first(page, pwd_candidates, password, "password"):
-                # Some Salesforce flows are two-step: email, click next, THEN
-                # password appears. Try clicking a 'next' then re-find password.
-                _click_first(page, submit_candidates, "next (two-step?)")
-                page.wait_for_timeout(1500)
+                try:
+                    # give the JS-rendered form time to appear
+                    page.wait_for_selector(
+                        'input[type="email"], input[type="password"], input[autocomplete="username"]',
+                        timeout=FIELD_TIMEOUT,
+                    )
+                except Exception:
+                    _dump_debug(page, "waiting-for-login-form")
+                    sys.exit("Could not find the login form. See login_page.html to "
+                             "adjust selectors (the fields may be inside a shadow root "
+                             "with unusual names).")
+
+                if not _fill_first(page, email_candidates, username, "username"):
+                    _dump_debug(page, "fill-username")
+                    sys.exit("Could not fill the username field — see debug dump.")
+
                 if not _fill_first(page, pwd_candidates, password, "password"):
-                    _dump_debug(page, "fill-password")
-                    browser.close()
-                    sys.exit("Could not fill the password field — see debug dump.")
+                    # Some Salesforce flows are two-step: email, click next, THEN
+                    # password appears. Try clicking a 'next' then re-find password.
+                    _click_first(page, submit_candidates, "next (two-step?)")
+                    page.wait_for_timeout(1500)
+                    if not _fill_first(page, pwd_candidates, password, "password"):
+                        _dump_debug(page, "fill-password")
+                        sys.exit("Could not fill the password field — see debug dump.")
 
-            if not _click_first(page, submit_candidates, "submit"):
-                _dump_debug(page, "click-submit")
-                browser.close()
-                sys.exit("Could not find the submit button — see debug dump.")
+                if not _click_first(page, submit_candidates, "submit"):
+                    _dump_debug(page, "click-submit")
+                    sys.exit("Could not find the submit button — see debug dump.")
 
-        # --- Wait for the connectcloud:// callback to be captured -------------
-        print("Waiting for login to complete ...")
-        deadline = time.time() + CALLBACK_TIMEOUT
-        while time.time() < deadline and "url" not in captured:
-            page.wait_for_timeout(250)   # pumps event handlers
+            # --- Wait for the connectcloud:// callback to be captured -------------
+            print("Waiting for login to complete ...")
+            deadline = time.time() + CALLBACK_TIMEOUT
+            while time.time() < deadline and "url" not in captured:
+                page.wait_for_timeout(250)   # pumps event handlers
 
-        if "url" not in captured:
-            _dump_debug(page, "no-callback")
+            if "url" not in captured:
+                _dump_debug(page, "no-callback")
+                sys.exit("Never saw the connectcloud:// callback. Likely causes: "
+                         "wrong credentials, MFA is enabled on this account (not "
+                         "supported yet), or a login-page change. See debug dump.")
+        finally:
+            # context.close() is what actually flushes the .har to disk.
+            context.close()
             browser.close()
-            sys.exit("Never saw the connectcloud:// callback. Likely causes: "
-                     "wrong credentials, MFA is enabled on this account (not "
-                     "supported yet), or a login-page change. See debug dump.")
-
-        browser.close()
+            if har_path and aura_log:
+                aura_log_path = Path(har_path).with_suffix(".aura.json")
+                aura_log_path.write_text(json.dumps(aura_log, indent=2))
+                print(f"  [debug] saved {len(aura_log)} Aura call(s) to {aura_log_path}")
 
     # --- Parse the code, verify state, exchange for tokens ------------------
     cb = urllib.parse.urlparse(captured["url"])
@@ -289,13 +344,17 @@ def main() -> None:
     ap.add_argument("--password", default=os.environ.get("CUMMINS_PASSWORD"))
     ap.add_argument("--headed", action="store_true",
                     help="show the browser window (debug / watch it work)")
+    ap.add_argument("--har", metavar="PATH",
+                    help="also record the full network conversation to this "
+                         ".har file (for reverse-engineering the Aura login "
+                         "sequence — see tools/redact_har.py before sharing it)")
     args = ap.parse_args()
 
     if not args.username or not args.password:
         ap.error("provide --username/--password or set "
                  "CUMMINS_USERNAME / CUMMINS_PASSWORD env vars")
 
-    bootstrap(args.username, args.password, headed=args.headed)
+    bootstrap(args.username, args.password, headed=args.headed, har_path=args.har)
 
 
 if __name__ == "__main__":

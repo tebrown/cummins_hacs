@@ -7,29 +7,31 @@ A Home Assistant custom integration that polls a Cummins home-standby
 generator's telemetry (battery voltage, running state, load, faults, etc.)
 through the **Cummins Connect Cloud mobile API** — the same backend the
 ConnectCloud phone app uses. No browser or headless Chromium runs on your
-Home Assistant instance; a one-time login happens on your own laptop instead.
+Home Assistant instance, even during setup: you sign in with your Cummins
+username and password right in the Home Assistant UI.
 
 Read-only in this release: sensors and binary sensors only. Start/Stop/Exercise
 commands are a planned phase 2 — see [`docs/DESIGN.md`](docs/DESIGN.md).
 
-## Why a separate login step?
+## How sign-in works (no browser, anywhere)
 
-The Cummins login is Salesforce SSO federated through AWS Cognito — a
-JS-rendered, stateful page that isn't practical (or safe) to reproduce with a
-bundled headless browser inside Home Assistant. Instead:
+The Cummins login is Salesforce SSO federated through AWS Cognito. Rather
+than driving a real browser through that (which wouldn't even be possible on
+Home Assistant OS — it's a read-only appliance with no way to run Chromium),
+this integration talks to the same login endpoints directly over HTTPS: it
+submits your username/password to Cummins' identity service, follows the
+SAML handshake back to Cognito, and stores only the resulting session
+(refresh) token — never your password.
 
-1. You run a small script **once, on your own computer**, which drives a
-   real (headless) browser through the login and captures a Cognito
-   **refresh token**.
-2. You paste that refresh token into Home Assistant's config flow.
-3. From then on, the integration talks to Cummins with plain HTTPS calls —
-   refreshing the access token as needed. No browser, no stored password.
-
-Full write-up of the auth mechanics: [`docs/DESIGN.md`](docs/DESIGN.md).
+This was reverse-engineered by capturing the real login traffic and
+confirming every step is a static, parseable HTTP exchange (no JavaScript
+execution required) — see [`docs/DESIGN.md`](docs/DESIGN.md) for the
+full write-up, including the known fragility: if Cummins changes their login
+page, this can break. If it does, there's a fallback (below).
 
 ## Installation
 
-### 1. Install the integration via HACS
+### 1. Install via HACS
 
 This repository isn't in the HACS default store yet, so add it as a
 **custom repository**:
@@ -39,7 +41,22 @@ This repository isn't in the HACS default store yet, so add it as a
 3. Find **Cummins Connect Cloud** in HACS and install it.
 4. Restart Home Assistant.
 
-### 2. Get a refresh token (once, on your own computer — not the HA box)
+### 2. Add the integration
+
+Settings → Devices & Services → **Add Integration** → **Cummins Connect
+Cloud** → **Username and password** → enter your Cummins Connect Cloud
+credentials. If your account has more than one generator, you'll be asked
+which one to add (repeat setup to add others).
+
+> MFA is not supported — if your account has it enabled, sign-in will fail.
+
+### Fallback: refresh token (if username/password sign-in doesn't work)
+
+If Cummins changes their login page and the built-in sign-in breaks before
+this integration is updated, there's a manual fallback: run a one-time,
+off-box login script that drives a real (headless) browser through the login
+and produces a refresh token, then paste that into the config flow's
+**Refresh token (advanced)** option instead.
 
 ```bash
 git clone https://github.com/tebrown/cummins_hacs
@@ -53,24 +70,13 @@ export CUMMINS_PASSWORD='...'
 python tools/bootstrap_login.py
 ```
 
-This logs in headlessly, catches the OAuth callback, exchanges it for tokens,
-and prints/saves a **refresh token**. Copy it — that's the only thing you
-paste into Home Assistant.
-
-> MFA is not supported by the bootstrap script yet. If your account has MFA,
-> add `--headed` and clear the MFA prompt by hand when the browser opens.
-
-### 3. Add the integration in Home Assistant
-
-Settings → Devices & Services → **Add Integration** → **Cummins Connect
-Cloud** → paste the refresh token. If your account has more than one
-generator, you'll be asked which one to add (repeat setup to add others).
+This prints/saves a **refresh token** — paste that into Home Assistant.
 
 ### Re-authenticating later
 
-Refresh tokens don't last forever. When yours expires, Home Assistant will
-surface a **Reauthenticate** notification for this integration — re-run
-`tools/bootstrap_login.py` and paste the new token in.
+Sessions don't last forever. When yours expires, Home Assistant will surface
+a **Reauthenticate** notification for this integration — just sign in again
+with your username and password.
 
 ## Entities
 
@@ -88,10 +94,12 @@ yet (contributions welcome — see `docs/DESIGN.md` §4).
 ## Repository layout
 
 ```
-custom_components/cummins_connectcloud/   the Home Assistant integration (HACS installs this)
-tools/bootstrap_login.py                  one-time, off-box login (Playwright) -> refresh token
-tools/cummins_connectcloud.py             standalone reference client / CLI (same API as the integration)
-docs/DESIGN.md                            how the auth was reverse-engineered, API notes, roadmap
+custom_components/cummins_connectcloud/          the Home Assistant integration (HACS installs this)
+custom_components/cummins_connectcloud/aura_auth.py  pure-HTTP username/password login (no browser)
+tools/bootstrap_login.py                         fallback: off-box login (Playwright) -> refresh token
+tools/cummins_connectcloud.py                    standalone reference client / CLI (same API as the integration)
+tools/capture_via_mitm.py, tools/redact_har.py   dev tools used to reverse-engineer the login flow
+docs/DESIGN.md                                   how the auth was reverse-engineered, API notes, roadmap
 ```
 
 ## Credit / prior art

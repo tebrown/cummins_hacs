@@ -1,6 +1,6 @@
 # Cummins Connect Cloud → Home Assistant Integration
 
-**Status:** §5 is scaffolded — `custom_components/cummins_connectcloud/` exists and is installable via HACS (read-only sensors/binary sensors). This document is kept as the design record; see the repo [README](../README.md) for user-facing install/usage instructions.
+**Status:** §5 is scaffolded and the config flow now supports native username/password sign-in (`aura_auth.py`, no browser anywhere) with the refresh-token paste flow kept as a fallback — `custom_components/cummins_connectcloud/` is installable via HACS (read-only sensors/binary sensors). This document is kept as the design record; see the repo [README](../README.md) for user-facing install/usage instructions.
 **Goal:** A `custom_components/cummins_connectcloud/` integration that polls a Cummins home-standby generator's telemetry (and optionally issues start/stop/exercise commands) via the Cummins Connect Cloud **mobile** API — with no browser dependency at runtime.
 
 ---
@@ -122,12 +122,28 @@ custom_components/cummins_connectcloud/
 ```
 
 ### Config flow
-- **Initial setup:** ask for username + password → run the bootstrap logic → obtain refresh token → store **only the refresh token** (+ id/access) in the encrypted config entry. Password is not persisted.
-  - **Design decision to resolve:** where does the browser run? HA OS is headless and shouldn't bundle Chromium. Options:
-    1. **Off-box bootstrap (recommended):** ship `bootstrap_login.py` as a standalone tool the user runs on their laptop; they paste the resulting **refresh token** into the HA config flow. Keeps Chromium out of HA entirely. Cleanest for HACS.
-    2. **In-container Playwright:** integration installs Playwright + Chromium on first setup. Heavy, fragile on HA OS/Alpine, larger attack surface. Avoid unless (1) proves too clunky.
-  - Leaning (1): HA config flow field = "refresh token" (+ a link to the bootstrap tool/instructions). The integration itself stays pure `requests`.
-- **Reauth flow:** on `invalid_grant`, HA prompts the user to supply a fresh refresh token (re-run bootstrap). Use HA's built-in `async_step_reauth`.
+
+**v0.1 (shipped):** paste-a-refresh-token flow — user runs `tools/bootstrap_login.py` off-box (Playwright), pastes the resulting refresh token into HA. Chosen because most users are on **Home Assistant OS**, which can't run a bundled Chromium at all (read-only appliance, no apt/package access) — ruling out in-container Playwright entirely, not just deprioritizing it.
+
+**v0.2 (shipped):** `custom_components/cummins_connectcloud/aura_auth.py` reimplements the Salesforce/Cognito login in pure `requests` — no browser anywhere, works on every HA install type including HAOS. The config flow's first step is now a menu: **username/password** (default, calls `aura_auth.login()`) or **refresh token** (advanced, the old v0.1 paste-a-token flow, kept as a fallback per the risk noted below). Reauth also asks for username/password.
+
+How the login chain actually works, confirmed by capturing full traffic with mitmproxy (Playwright's own HAR/CDP body capture unreliably drops `Cache-Control: no-store` response bodies — several hops here use exactly that, so mitmproxy was necessary, not just convenient — see `tools/capture_via_mitm.py` / `tools/_mitm_aura_addon.py`):
+
+1. GET the Cognito authorize URL (PKCE) → `requests` auto-follows the leading 302s → lands on a 401 from `/clw/idp/login` whose body is a **static** bounce page (either `var url = '...'` or a literal `window.location.replace('...')` — both forms appear at different hops; neither computes anything dynamically, both are plain regex-extractable).
+2. Follow that to the actual (guest-session) login page. Its `fwuid`/`app`/`loaded`-map (the Aura "context" needed on every subsequent call) are embedded directly in the HTML inside a `<script src="/clw/s/sfsites/l/{...json...}/...">` tag — also just a regex away, not exposed any other way.
+3. POST credentials as an Aura `ApexActionController/ACTION$execute` call to Cummins' own custom Apex bridge, `IAM_VisualforceToLightning.getDoLogin` (`fedID`/`password`/`startURL` as form fields inside a `message=` JSON blob, form-urlencoded). This is Cummins' own SSO glue, not a generic Salesforce Experience Cloud login — the class name and `WWID` (WorldWide ID) references are Cummins-internal identity concepts.
+4. On success, the response's `returnValue.returnValue` is a **fully-formed `frontdoor.jsp?...&sid=...` URL**, constructed server-side by that same Apex bridge — no client-side session-ID handling needed at all.
+5. GET that URL → another static JS bounce → back to `/clw/idp/login`, now authenticated (200 instead of 401) → its body is a standard auto-submitting SAML form (`RelayState` + `SAMLResponse` hidden inputs, HTML-entity-encoded attribute values). POST those two fields to Cognito's `/saml2/idpresponse` ourselves (`allow_redirects=False`) instead of running the page's `onload` JS.
+6. Cognito responds 302 with `Location: connectcloud://authentication/callback?code=...` — extract `code`, verify `state`, exchange for tokens exactly as the existing PKCE flow already does.
+
+Nothing in this chain executes JavaScript — every hop that looked like it might need a JS engine turned out to be a static, server-rendered redirect or form. Known risks/limits (unchanged from the analysis, now that it's actually implemented):
+- **Unconfirmed error shape.** Only a *successful* login was ever captured (mitmproxy sessions were run against a real, working account) — what `getDoLogin` returns for a wrong password was never observed. Any non-success shape is treated as a generic auth failure; if this turns out wrong in practice, it needs a real bad-password capture to fix properly.
+- **Still no MFA support** — same limitation as the Playwright bootstrap; if a given account has MFA, this will just fail somewhere in the chain with an unhelpful error, not a clear "needs MFA" message.
+- **`getWWIDLoginInstructions`/`getAppMappingDetails`** (called by the real browser flow before `getDoLogin`, seemingly just to render UI label text) are skipped — unconfirmed whether the server requires them first. First thing to check if `getDoLogin` starts failing while the browser-based bootstrap still works.
+- If Cummins changes their login page in a way this can't follow, the v0.1 refresh-token fallback is still there — by design, so a breakage here doesn't mean bundling a browser into the integration.
+- The stored secret is unchanged either way: only the **refresh token** ends up in the config entry. Username/password are used transiently to obtain it and are never persisted.
+
+**A meta-lesson from building this:** every redaction pass on the capture data used to build this (`tools/redact_har.py`) missed something on the first attempt — a live Salesforce session ID hidden in a raw URL string, a plaintext password inside a form-urlencoded field nested in JSON, the same session ID again behind percent-encoding, and a full SAMLResponse assertion inside a raw HTML `<input>` tag never seen by the JSON/form-aware redaction paths. Each was a different encoding layer or body format the *previous* fix didn't anticipate. If capturing this login flow again (e.g. after a Cummins login-page change), don't assume `redact_har.py` catches everything on the first pass — verify by recursively walking the JSON and unquoting every string several layers deep before trusting a capture is safe to share.
 
 ### Coordinator
 - `DataUpdateCoordinator`, poll interval ~60s (tune vs. `LastCheckIn` cadence; device telemetry looked ~event-driven, so 1–5 min is plenty and gentle on the API).
@@ -169,9 +185,10 @@ Binary sensors:
 
 ## 7. Status / next steps
 
-Done: `custom_components/cummins_connectcloud/` scaffolded per §5 with the config-flow decision = **off-box bootstrap, paste refresh token**; `api.py` ported, coordinator + read-only sensor/binary_sensor entities wired up; repo has `hacs.json`, README, and a hassfest/HACS validation GitHub Action.
+Done: `custom_components/cummins_connectcloud/` scaffolded per §5; `api.py` ported, coordinator + read-only sensor/binary_sensor entities wired up; repo has `hacs.json`, README, and a hassfest/HACS validation GitHub Action. Config flow supports both v0.2 (username/password via `aura_auth.py`, no browser) and v0.1 (paste a refresh token, fallback) — see §5 for how the login reimplementation works and its confirmed-vs-assumed pieces.
 
 Remaining:
+- **Not yet tested against a live account end-to-end inside real Home Assistant.** The Aura login chain in `aura_auth.py` was validated offline against captured traffic (every regex confirmed to extract correctly from real response bodies) and the module compiles, but no one has actually run `async_step_credentials` against a live Cummins account inside HA yet. This is the top priority before relying on it.
 - Decode the `gensetStatus` / `loadStatus` / `powerSource` enums (§4) and expose them as proper enum sensors instead of raw integers.
 - Phase 2: re-capture the mobile command POST shape and add `StartGenset`/`StopGenset` controls, gated on `CommandsEnabled`/`IsEnabled`.
-- Get eyes on a real HA instance to confirm the config flow and entity behavior end-to-end (this has been built and reviewed but not yet run inside live Home Assistant).
+- Confirm whether skipping `getWWIDLoginInstructions`/`getAppMappingDetails` before `getDoLogin` is actually safe (see §5's known-risk list) — only matters if login starts failing.
