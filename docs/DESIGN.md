@@ -1,6 +1,6 @@
 # Cummins Connect Cloud → Home Assistant Integration
 
-**Status:** §5 is scaffolded and the config flow now supports native username/password sign-in (`aura_auth.py`, no browser anywhere) with the refresh-token paste flow kept as a fallback — `custom_components/cummins_connectcloud/` is installable via HACS (read-only sensors/binary sensors). This document is kept as the design record; see the repo [README](../README.md) for user-facing install/usage instructions.
+**Status:** Working end to end against a live account. Native username/password sign-in (`aura_auth.py`, no browser anywhere, `curl_cffi` for TLS-fingerprint reasons — see §5) is confirmed working inside real Home Assistant, with the refresh-token paste flow kept as a fallback. `custom_components/cummins_connectcloud/` is installable via HACS (read-only sensors/binary sensors). This document is kept as the design record; see the repo [README](../README.md) for user-facing install/usage instructions.
 **Goal:** A `custom_components/cummins_connectcloud/` integration that polls a Cummins home-standby generator's telemetry (and optionally issues start/stop/exercise commands) via the Cummins Connect Cloud **mobile** API — with no browser dependency at runtime.
 
 ---
@@ -193,8 +193,9 @@ Binary sensors:
 
 Done: `custom_components/cummins_connectcloud/` scaffolded per §5; `api.py` ported, coordinator + read-only sensor/binary_sensor entities wired up; repo has `hacs.json`, README, and a hassfest/HACS validation GitHub Action. Config flow supports both v0.2 (username/password via `aura_auth.py`, no browser) and v0.1 (paste a refresh token, fallback) — see §5 for how the login reimplementation works and its confirmed-vs-assumed pieces.
 
+Done: **confirmed with a real successful live-account login**, both standalone (`tools/test_aura_login.py` returned real tokens) and inside actual Home Assistant via `async_step_credentials` — the v0.2.1 `curl_cffi` fix (see §5) resolved the TLS-fingerprinting block and the full username/password flow works end to end.
+
 Remaining:
-- **Not yet confirmed with a real successful live-account login.** `tools/test_aura_login.py` reaches `getDoLogin` correctly and returns the confirmed wrong-password error shape with bad credentials (proving the whole chain up through that point works against the live site with `curl_cffi`), but no one has yet run it with real, correct credentials all the way through to a working refresh token, nor exercised `async_step_credentials` inside actual Home Assistant. Top priority before relying on this.
 - Decode the `gensetStatus` / `loadStatus` / `powerSource` enums (§4) and expose them as proper enum sensors instead of raw integers.
 - Phase 2: re-capture the mobile command POST shape and add `StartGenset`/`StopGenset` controls, gated on `CommandsEnabled`/`IsEnabled`.
 - Confirm whether skipping `getWWIDLoginInstructions`/`getAppMappingDetails` before `getDoLogin` is actually safe (see §5's known-risk list) — only matters if login starts failing.

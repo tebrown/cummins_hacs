@@ -11,8 +11,10 @@ tools/login_error.png
 tools/login_page.html
 *.har
 login_capture*.json
+telemetry_log*.jsonl
 
 # OS / editor
 .DS_Store
 .idea/
 .vscode/
+Screenshot *.png

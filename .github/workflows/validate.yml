@@ -24,3 +24,8 @@ jobs:
       - uses: hacs/action@main
         with:
           category: integration
+          # brands: requires submitting an icon to home-assistant/brands (a
+          # separate external repo/PR) — not needed for HACS custom-repository
+          # installs, only for default-store listing. Revisit if this ever
+          # gets submitted there.
+          ignore: brands
