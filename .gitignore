@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Cummins bootstrap artifacts (secrets / debug dumps — never commit these)
+.cummins_tokens.json
+tools/login_error.png
+tools/login_page.html
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

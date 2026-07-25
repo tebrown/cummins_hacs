@@ -1,18 +1,18 @@
 # Cummins Connect Cloud → Home Assistant Integration
 
-**Status:** Working proof-of-concept (auth + data pull). Ready to build into a HACS custom integration.
+**Status:** §5 is scaffolded — `custom_components/cummins_connectcloud/` exists and is installable via HACS (read-only sensors/binary sensors). This document is kept as the design record; see the repo [README](../README.md) for user-facing install/usage instructions.
 **Goal:** A `custom_components/cummins_connectcloud/` integration that polls a Cummins home-standby generator's telemetry (and optionally issues start/stop/exercise commands) via the Cummins Connect Cloud **mobile** API — with no browser dependency at runtime.
 
 ---
 
 ## 1. What we have (working today)
 
-Two Python files, both verified end-to-end against a live account:
+Two Python files (now under `tools/`), both verified end-to-end against a live account, plus the scaffolded integration under `custom_components/cummins_connectcloud/` (ported from the client below):
 
 | File | Role | Runtime deps |
 |---|---|---|
-| `bootstrap_login.py` | **One-time** login. Headless Playwright drives username/password login, catches the OAuth `code`, exchanges it, writes `~/.cummins_tokens.json`. | playwright, requests |
-| `cummins_connectcloud.py` | **Runtime** client. Pure `requests`. Refreshes the access + id token from the stored refresh token and calls the mobile API. Has endpoint wrappers + a telemetry flattener. | requests only |
+| `tools/bootstrap_login.py` | **One-time** login. Headless Playwright drives username/password login, catches the OAuth `code`, exchanges it, writes `~/.cummins_tokens.json`. | playwright, requests |
+| `tools/cummins_connectcloud.py` | **Standalone reference** client / CLI. Pure `requests`. Refreshes the access + id token from the stored refresh token and calls the mobile API. Has endpoint wrappers + a telemetry flattener. `custom_components/cummins_connectcloud/api.py` is the HA-flavored port of this. | requests only |
 
 Confirmed working: bootstrap logs in headlessly (first try, Shadow-DOM login form and all), runtime pulls the full telemetry set with no browser.
 
@@ -167,5 +167,11 @@ Binary sensors:
 - Prior art (Selenium + MQTT, current auth stack): `github.com/wareed1/Cummins-Generator-to-Home-Assistant` — reuse its `configuration.yaml` MQTT sensor + freshness/exercise template ideas even if going native.
 - HA forum thread: `community.home-assistant.io/t/cummins-cloud-connect-generators/398442` (history: old Microsoft B2C stack → migrated to current Salesforce/Cognito).
 
-## 7. Immediate next step
-Scaffold `custom_components/cummins_connectcloud/` per §5 with the config-flow decision = **off-box bootstrap, paste refresh token**. Port `api.py` from `cummins_connectcloud.py`, wire the coordinator + read-only entities, defer commands to phase 2.
+## 7. Status / next steps
+
+Done: `custom_components/cummins_connectcloud/` scaffolded per §5 with the config-flow decision = **off-box bootstrap, paste refresh token**; `api.py` ported, coordinator + read-only sensor/binary_sensor entities wired up; repo has `hacs.json`, README, and a hassfest/HACS validation GitHub Action.
+
+Remaining:
+- Decode the `gensetStatus` / `loadStatus` / `powerSource` enums (§4) and expose them as proper enum sensors instead of raw integers.
+- Phase 2: re-capture the mobile command POST shape and add `StartGenset`/`StopGenset` controls, gated on `CommandsEnabled`/`IsEnabled`.
+- Get eyes on a real HA instance to confirm the config flow and entity behavior end-to-end (this has been built and reviewed but not yet run inside live Home Assistant).

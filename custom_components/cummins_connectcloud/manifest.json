@@ -1,0 +1,12 @@
+{
+  "domain": "cummins_connectcloud",
+  "name": "Cummins Connect Cloud",
+  "codeowners": ["@tebrown"],
+  "config_flow": true,
+  "documentation": "https://github.com/tebrown/cummins_hacs",
+  "integration_type": "hub",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/tebrown/cummins_hacs/issues",
+  "requirements": ["requests>=2.31.0"],
+  "version": "0.1.0"
+}

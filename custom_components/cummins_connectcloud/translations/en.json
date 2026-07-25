@@ -1,0 +1,58 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to Cummins Connect Cloud",
+        "description": "Paste the refresh token produced by running `tools/bootstrap_login.py` on your laptop (see the repository README). Home Assistant only ever sees this token, never your Cummins/Salesforce password.",
+        "data": {
+          "refresh_token": "Refresh token"
+        }
+      },
+      "asset": {
+        "title": "Choose a generator",
+        "description": "More than one generator was found on this account. Pick the one to add now — run setup again to add another.",
+        "data": {
+          "asset_id": "Generator"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Re-authenticate Cummins Connect Cloud",
+        "description": "The stored refresh token is no longer valid (it may have expired or been revoked). Run `tools/bootstrap_login.py` again and paste the new refresh token below.",
+        "data": {
+          "refresh_token": "Refresh token"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "The refresh token was rejected. It may be expired or revoked — re-run the bootstrap tool.",
+      "cannot_connect": "Could not reach Cummins Connect Cloud. Check your network connection and try again.",
+      "no_assets": "No generators were found on this Cummins account.",
+      "unknown": "Unexpected error. Check the Home Assistant logs for details."
+    },
+    "abort": {
+      "already_configured": "This generator is already configured.",
+      "reauth_successful": "Re-authentication was successful."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "battery_voltage": { "name": "Battery voltage" },
+      "engine_runtime": { "name": "Engine runtime" },
+      "load": { "name": "Load" },
+      "output_voltage": { "name": "Output voltage" },
+      "output_frequency": { "name": "Output frequency" },
+      "engine_speed": { "name": "Engine speed" },
+      "firmware_version": { "name": "Firmware version" },
+      "last_check_in": { "name": "Last check-in" }
+    },
+    "binary_sensor": {
+      "running": { "name": "Running" },
+      "utility_power_available": { "name": "Utility power available" },
+      "exercising": { "name": "Exercising" },
+      "standby_enabled": { "name": "Standby enabled" },
+      "remote_control_enabled": { "name": "Remote control enabled" },
+      "fault": { "name": "Fault" },
+      "data_stale": { "name": "Data stale" }
+    }
+  }
+}

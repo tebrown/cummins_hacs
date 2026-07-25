@@ -279,7 +279,8 @@ def bootstrap(username: str, password: str, headed: bool = False) -> None:
     os.chmod(TOKEN_CACHE, 0o600)
     print(f"\n\u2713 Success. Tokens saved to {TOKEN_CACHE}")
     print("  You're bootstrapped — the runtime client is now browser-free.")
-    print("  Verify with:  python cummins_connectcloud.py test")
+    print("  Verify with:  python tools/cummins_connectcloud.py test")
+    print("  Then paste this refresh_token into the Home Assistant config flow.")
 
 
 def main() -> None:

@@ -298,9 +298,9 @@ def interactive_login(token_cache: Path | str = DEFAULT_TOKEN_CACHE) -> None:
 # ---------------------------------------------------------------------------
 # CLI: quick self-test.  Bootstrap first (one of):
 #   * export CUMMINS_REFRESH_TOKEN=<the refresh_token from your capture>
-#   * python cummins_connectcloud.py login      # interactive PKCE
+#   * python tools/cummins_connectcloud.py login      # interactive PKCE
 # Then:
-#   python cummins_connectcloud.py test          # refresh + dump telemetry
+#   python tools/cummins_connectcloud.py test          # refresh + dump telemetry
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import sys
