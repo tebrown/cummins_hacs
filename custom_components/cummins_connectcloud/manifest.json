@@ -7,6 +7,6 @@
   "integration_type": "hub",
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/tebrown/cummins_hacs/issues",
-  "requirements": ["requests>=2.31.0"],
-  "version": "0.2.0"
+  "requirements": ["requests>=2.31.0", "curl_cffi>=0.7.0"],
+  "version": "0.2.1"
 }

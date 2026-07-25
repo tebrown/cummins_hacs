@@ -17,15 +17,25 @@ already baked into the HTML — nothing computed client-side) or a standard
 auto-submitting SAML form. Nothing in this chain requires executing
 JavaScript, just parsing it out with regexes.
 
+IMPORTANT — TLS fingerprinting: plain `requests`/urllib3 does NOT work here.
+Confirmed by direct A/B testing: identical requests (same URL, same
+User-Agent, same headers, same cookies) succeed from a real browser (Chrome,
+or Playwright-driven Chromium — see tools/bootstrap_login.py) and from
+`curl_cffi` impersonating Chrome, but get served a different, generic
+Salesforce template (missing the Aura app bootstrap entirely) from plain
+`requests`. Headers were identical in all cases, so this isn't a header
+check — it's almost certainly Salesforce's edge (server header: `sfdcedge`)
+fingerprinting the TLS handshake itself (JA3/JA4), which differs between a
+real browser's TLS stack and Python's OpenSSL-based one regardless of what
+headers claim. `curl_cffi` (libcurl + a browser-matching TLS fingerprint)
+gets through; that's why it's used here instead of `requests`. If this ever
+needs re-diagnosing: reproduce with `tools/test_aura_login.py` (fast, no HA
+needed) before touching Home Assistant at all.
+
 Known limitations (same as bootstrap_login.py):
   * No MFA support — Cummins' identity bridge doesn't appear to prompt for
     it today, but if a given account has it enabled this will fail at
     getDoLogin with an unhelpful error rather than a clear "needs MFA" one.
-  * The response SHAPE for a *wrong* password was never captured (only a
-    successful login was available to reverse-engineer from) — any
-    non-success shape from getDoLogin is treated as AuraLoginError with
-    whatever diagnostic text is available, rather than pattern-matching a
-    specific "bad password" response we haven't actually seen.
   * Whether getWWIDLoginInstructions/getAppMappingDetails need to be called
     before getDoLogin (the real browser flow calls them, seemingly just to
     render UI text) is unconfirmed — this skips them. If getDoLogin starts
@@ -47,9 +57,17 @@ import secrets
 import urllib.parse
 from typing import Any
 
-import requests
+from curl_cffi import requests
 
-from .const import AUTHORIZE_URL, CLIENT_ID, REDIRECT_URI, SCOPE, TOKEN_URL, USER_AGENT
+try:
+    from .const import AUTHORIZE_URL, CLIENT_ID, REDIRECT_URI, SCOPE, TOKEN_URL
+except ImportError:
+    # Allows tools/test_aura_login.py to import this module standalone (no
+    # Home Assistant, no package context) for fast local iteration against
+    # a live account — this is screen-scraping an external, changeable
+    # login flow, so being able to test it in seconds instead of a full
+    # HACS-update/HA-restart/config-flow-click cycle matters a lot.
+    from const import AUTHORIZE_URL, CLIENT_ID, REDIRECT_URI, SCOPE, TOKEN_URL
 
 LOGIN_TIMEOUT = 30
 
@@ -184,7 +202,6 @@ def _post_aura(
         aura_endpoint,
         params={"r": "0", "aura.ApexAction.execute": "1"},
         data=data,
-        headers={"user-agent": USER_AGENT},
         timeout=LOGIN_TIMEOUT,
     )
     resp.raise_for_status()
@@ -193,9 +210,13 @@ def _post_aura(
         raise AuraLoginError(f"Unexpected Aura response shape: {body!r}"[:300])
     result = body["actions"][0]
     if result.get("state") != "SUCCESS":
+        # Confirmed shape for a wrong password (live-tested):
+        # {"state": "ERROR", "error": [{"message": "Your login attempt has
+        # failed. Make sure the username and password are correct."}]}
+        errors = result.get("error") or []
+        message = errors[0]["message"] if errors and "message" in errors[0] else None
         raise AuraLoginError(
-            (f"Aura action {action['params']['method']} failed: "
-             f"{result.get('error') or result}")[:300]
+            message or f"Aura action {action['params']['method']} failed: {result}"[:300]
         )
     return result["returnValue"]
 
@@ -204,21 +225,20 @@ def login(username: str, password: str) -> dict:
     """Log in with a username/password, no browser.
 
     Returns the Cognito token response dict (access_token, id_token,
-    refresh_token, expires_in). Raises AuraLoginError on any failure along
-    the chain — wrong credentials and "Cummins changed something" both
-    surface this way; there's no reliable way yet to tell them apart (see
-    module docstring).
+    refresh_token, expires_in). Raises AuraLoginError with the site's own
+    message on a wrong password (confirmed shape, see _post_aura); other
+    failures along the chain raise it with whatever diagnostic is available.
     """
     verifier, challenge = _pkce()
     state = secrets.token_urlsafe(32)
-    session = requests.Session()
-    session.headers.update(
-        {
-            "user-agent": USER_AGENT,
-            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "accept-language": "en-US,en;q=0.9",
-        }
-    )
+    # impersonate="chrome": deliberately NOT setting a custom User-Agent here
+    # (unlike api.py's mobile-API client). curl_cffi's Chrome impersonation
+    # sets a full, internally-consistent set of browser headers matching its
+    # TLS fingerprint; overriding just the User-Agent would make the two
+    # inconsistent, which is arguably a worse signal to a fingerprinting WAF
+    # than either alone. See module docstring for why curl_cffi is used at
+    # all instead of plain `requests`.
+    session = requests.Session(impersonate="chrome")
 
     authorize_url = f"{AUTHORIZE_URL}?" + urllib.parse.urlencode(
         {
@@ -330,7 +350,11 @@ def login(username: str, password: str) -> dict:
     if not code:
         raise AuraLoginError(f"No authorization code in callback: {callback_url[:200]}")
 
-    token_resp = requests.post(
+    # Reuse the same impersonated session rather than a bare module-level
+    # call — this hits Cognito directly rather than Cummins' Salesforce edge,
+    # so it's less likely to need it, but there's no reason to introduce an
+    # inconsistent (non-impersonated) client at the last step.
+    token_resp = session.post(
         TOKEN_URL,
         data={
             "grant_type": "authorization_code",
@@ -338,10 +362,6 @@ def login(username: str, password: str) -> dict:
             "code": code,
             "redirect_uri": REDIRECT_URI,
             "code_verifier": verifier,
-        },
-        headers={
-            "content-type": "application/x-www-form-urlencoded; charset=utf-8",
-            "user-agent": USER_AGENT,
         },
         timeout=LOGIN_TIMEOUT,
     )
